@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
+import sys
 import threading
 import traceback
 
@@ -297,10 +299,16 @@ class DiagnosticServer:
         return server
 
 
-def build_config(host, port, verbose, cache_ttl=300.0):
+def build_config(
+    host, port, verbose, cache_ttl=300.0, root_workers=8, cache_path=None
+):
+    if root_workers is None or root_workers < 2:
+        root_workers = 8
     if cache_ttl <= 0:
         cache_ttl = None  # no caching
-    provider = DataPublicLuProvider(cache_ttl)
+    provider = DataPublicLuProvider(
+        cache_ttl, root_workers=root_workers, cache_path=cache_path
+    )
 
     config = {
         "host": host,
@@ -323,8 +331,14 @@ def build_config(host, port, verbose, cache_ttl=300.0):
     return config
 
 
-def run(config):
-    """Serve the WsgiDAV app with the Cheroot WSGI server."""
+def run(config, shutdown_timeout: float = 5.0):
+    """Serve the WsgiDAV app with the Cheroot WSGI server.
+
+    The server runs in a background thread while the main thread blocks on a
+    stop event.  ``SIGINT`` and ``SIGTERM`` set that event, which triggers a
+    graceful shutdown: Cheroot stops accepting new connections and — within
+    ``shutdown_timeout`` seconds — drains in-flight requests before closing.
+    """
     from cheroot import wsgi
 
     app = WsgiDAVApp(config)
@@ -338,13 +352,55 @@ def run(config):
         server_name="udata-webdav",
         numthreads=50,
     )
+    server.shutdown_timeout = float(shutdown_timeout)
     DiagnosticServer().wrap(server)
+
+    stop_event = threading.Event()
+    _signals_seen = 0
+
+    def _request_stop(signum=None, _frame=None):
+        """Signal handler: begin graceful shutdown, force-exit if repeated."""
+        nonlocal _signals_seen
+        _signals_seen += 1
+        name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+        if _signals_seen == 1:
+            logger.info(
+                "%s received: draining in-flight requests "
+                "(timeout %.1fs)...",
+                name,
+                server.shutdown_timeout,
+            )
+            stop_event.set()
+        else:
+            logger.warning("%s received again: exiting immediately.", name)
+            try:
+                server.stop()
+            finally:
+                import os
+
+                os._exit(130)
+
+    # Only the main thread may (re)install signal handlers; run() is invoked
+    # from main()'s main thread.
+    signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
+
+    server_thread = threading.Thread(
+        target=server.start, name="udata-webdav", daemon=True
+    )
+    server_thread.start()
     try:
-        server.start()
+        # Block the main thread until a signal asks us to stop.  This also lets
+        # Ctrl+C (SIGINT) flow through the handler above rather than raising an
+        # unrelated KeyboardInterrupt in the middle of connection handling.
+        stop_event.wait()
     except KeyboardInterrupt:
         pass
     finally:
+        # Graceful stop: stops accepting and drains in-flight requests up to
+        # shutdown_timeout before closing listening/worker sockets.
         server.stop()
+        server_thread.join(timeout=shutdown_timeout + 2.0)
 
 
 def main(argv=None):
@@ -360,20 +416,78 @@ def main(argv=None):
         help="Seconds to cache listings in memory (0 disables caching)",
     )
     parser.add_argument(
+        "--cache-file",
+        default=None,
+        help=(
+            "Path to a persistent JSON cache file. When set, org/dataset "
+            "listings are saved here and re-warmed from disk on restart, so a "
+            "reboot doesn't re-fetch every listing from data.public.lu."
+        ),
+    )
+    parser.add_argument(
+        "--root-workers",
+        type=int,
+        default=8,
+        help=(
+            "Max concurrent API calls used to confirm zero/unknown-count orgs "
+            "have datasets when listing '/'. Lower it to further limit load on "
+            "data.public.lu (min 2)."
+        ),
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=20.0,
+        help=(
+            "Max outbound requests per second to data.public.lu (token bucket; "
+            "0 disables). Covers metadata, small files and range reads. "
+            "Transient failures (5xx/429) are retried with backoff."
+        ),
+    )
+    parser.add_argument(
+        "--shutdown-timeout",
+        type=float,
+        default=5.0,
+        help=(
+            "Seconds to wait for in-flight requests to finish before closing "
+            "on SIGINT/SIGTERM (graceful shutdown drain window)."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="count", default=1, help="Increase verbosity"
     )
     args = parser.parse_args(argv)
 
-    config = build_config(args.host, args.port, args.verbose, args.cache_ttl)
+    # Apply the outbound throttle before any request can occur.  The limiter is
+    # a module-level lazy singleton, so setting the constants now is enough.
+    import dataprovider as dp
 
-    # Configure our module logger.
-    logging.getLogger("udata-dav").setLevel(
-        logging.DEBUG if args.verbose >= 2 else logging.INFO
+    dp._RATE_REQUESTS_PER_SEC = max(0.0, args.rate_limit)
+    dp._RATE_LIMITER = dp.RateLimiter(
+        dp._RATE_REQUESTS_PER_SEC,
+        dp._RATE_BURST,
     )
+
+    config = build_config(
+        args.host,
+        args.port,
+        args.verbose,
+        args.cache_ttl,
+        args.root_workers,
+        args.cache_file,
+    )
+
+    # Configure our module logger: level + a stderr stream handler so lifecycle
+    # and diagnostic INFO/WARNING lines are visible (not just the lastResort
+    # handler used for unconfigured WARNING+ records).
+    app_log = logging.getLogger("udata-dav")
+    app_log.setLevel(logging.DEBUG if args.verbose >= 2 else logging.INFO)
+    if not app_log.handlers:
+        app_log.addHandler(logging.StreamHandler(sys.stderr))
 
     print(f"data.public.lu WebDAV server on http://{args.host}:{args.port}/")
     print("Virtual tree: /<organisation>/<dataset>/<file>")
-    run(config)
+    run(config, shutdown_timeout=args.shutdown_timeout)
 
 
 if __name__ == "__main__":
