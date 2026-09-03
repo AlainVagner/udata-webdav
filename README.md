@@ -54,9 +54,18 @@ you can explore and open datasets just like local files.
 
 ## Installation
 
+Sur Mac:
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e .
+source ./.venv/bin/activate
+pip install -e .
+```
+
+On Windows:
+```bash
+python -m venv .venv
+source ./.venv/bin/activate
+pip install -e .
 ```
 
 This installs the `udata-webdav` console entry point.
@@ -67,7 +76,7 @@ Start the server:
 
 
 ```bash
-.venv/bin/python server.py --host 127.0.0.1 --port 8080
+python server.py --host 127.0.0.1 --port 8080
 ```
 
 Then open the share in your file manager:
